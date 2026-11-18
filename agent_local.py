@@ -452,6 +452,12 @@ def node():
   name = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True).stdout.strip()
   mem = {line.split(":")[0]: int(line.split()[1]) * 1024 for line in open("/proc/meminfo") if line.split()[1:2]}
   return {"gpu": name, "ram_total": mem.get("MemTotal", 0), "ram_available": mem.get("MemAvailable", 0), "home": os.path.expanduser("~"), "host": os.uname().nodename}
+def data_dir():
+  home = os.path.expanduser("~")
+  share = os.path.join(home, ".local", "share", "omarchy")
+  if os.path.islink(share) and not os.access(os.path.realpath(share), os.W_OK):
+    return os.path.join(home, ".local", "state", "omarchy", "agent-local", "data")
+  return os.path.join(share, "agent-local")
 '''
 
 
@@ -1438,9 +1444,9 @@ def prune_filesets(rid, keep):
   # The peer's copies too, once the setup that replaced them is the current one.
   setup = (load_model(rid) or {}).get("pair")
   if setup:
-    peer_base = os.path.dirname(peer_fileset_dir(setup, rid, keep))
     q = shlex.quote
     try:
+      peer_base = os.path.dirname(peer_fileset_dir(setup, rid, keep))
       pair_ssh(setup["peer"], f"cd {q(peer_base)} && for d in *; do case $d in {q(keep)}|{q(keep)}.*) ;; *) rm -rf -- \"$d\" ;; esac; done", check=False)
     except LocalError:
       pass
@@ -2049,12 +2055,17 @@ def worker_name(rid):
   return f"{UNIT_PREFIX}{rid}-rank1"
 
 
-def rank_dir(rid, fileset, rank, home_dir=None):
-  return os.path.join(home_dir or home(), ".local", "share", "omarchy", "agent-local", "models", rid, f"{fileset}.rank{rank}")
+def rank_dir(rid, fileset, rank, data_root=None):
+  return os.path.join(data_root or data_dir(), "models", rid, f"{fileset}.rank{rank}")
 
 
-def peer_fileset_dir(pair, rid, fileset):
-  return os.path.join(pair["home"], ".local", "share", "omarchy", "agent-local", "models", rid, fileset)
+def peer_data_dir(pair):
+  """The peer's weight directory, which falls back beside its state when its share is protected."""
+  return pair_python(pair["peer"], "data_dir()")
+
+
+def peer_fileset_dir(pair, rid, fileset, data_root=None):
+  return os.path.join(data_root or peer_data_dir(pair), "models", rid, fileset)
 
 
 def pair_env_path(rid):
@@ -2141,6 +2152,7 @@ def pair_setup(rid, manifest, runtime, pair):
     update_installing(rid, pair=manifest["pair"])
   ensure_dir(rank_dir(rid, fileset, 0))
   peer = pair["peer"]
+  peer_data = peer_data_dir(pair)
   q = shlex.quote
   if pair_ssh(peer, f"podman image exists {q(ident)}", check=False).returncode != 0:
     say(f"Copying the runtime image to {pair['host']} over the link")
@@ -2150,14 +2162,14 @@ def pair_setup(rid, manifest, runtime, pair):
     if save.wait() != 0 or load.returncode != 0:
       raise LocalError(f"Copying the image to {pair['host']} failed: {load.stderr.strip()[-400:]}", short="Image copy to the peer failed")
     pair_ssh(peer, f"podman image exists {q(ident)}")
-  target = peer_fileset_dir(pair, rid, fileset)
+  target = peer_fileset_dir(pair, rid, fileset, peer_data)
   say(f"Copying the model files to {pair['host']} over the link (only what it lacks)")
   pair_ssh(peer, f"mkdir -p {q(target)}")
   rsync = ["rsync", "-a", "--partial", "--delete", "--info=progress2", "--no-inc-recursive",
            "-e", shlex.join(pair_ssh_argv() + ["-o", "Compression=no", "-c", "aes128-gcm@openssh.com"]), f"{models}/", f"{peer}:{target}/"]
   if subprocess.run(rsync, stdin=subprocess.DEVNULL).returncode != 0:
     raise LocalError(f"Copying the model files to {pair['host']} failed", short="Copy to the peer failed")
-  pair_ssh(peer, f"mkdir -p {q(rank_dir(rid, fileset, 1, pair['home']))}")
+  pair_ssh(peer, f"mkdir -p {q(rank_dir(rid, fileset, 1, peer_data))}")
 
 
 def _placeholders(text, values):
@@ -2178,6 +2190,7 @@ def pair_worker_start(rid):
   # Also here: systemd's restarts after a failure don't pass admission.
   pair_limits(pair["peer"])
   peer_headroom(pair["peer"], variant)
+  peer_data = peer_data_dir(pair)
   spec = runtime["pair"]
   def environment(rank, side):
     values = {"@RANK@": str(rank), "@WORLD@": str(spec["nodes"]), "@MASTER_ADDR@": here["addr"],
@@ -2193,7 +2206,7 @@ def pair_worker_start(rid):
   command = ["podman", "run", "-d", "--replace", "--name", worker_name(rid), "--label", f"org.omarchy.agent-local.recipe={rid}",
              "--network", "host", "--read-only", "--tmpfs", "/tmp", "--cap-drop", "all", "--security-opt", "no-new-privileges", "--device", "nvidia.com/gpu=all", "--device", "/dev/infiniband",
              "--ulimit", "memlock=-1:-1", "--ulimit", "stack=67108864:67108864",
-             "-v", f"{peer_fileset_dir(pair, rid, fileset)}:/models:ro", "-v", f"{rank_dir(rid, fileset, 1, pair['home'])}:{spec['state']}"]
+             "-v", f"{peer_fileset_dir(pair, rid, fileset, peer_data)}:/models:ro", "-v", f"{rank_dir(rid, fileset, 1, peer_data)}:{spec['state']}"]
   if run.get("shm_size_gib"):
     command += ["--shm-size", f"{int(run['shm_size_gib'] * 1024)}m"]
   for name, value in sorted(worker.items()):
@@ -2220,12 +2233,12 @@ def pair_remove(manifest, local_only=False):
     return
   rid = manifest["recipe_id"]
   q = shlex.quote
-  base = os.path.join(setup["home"], ".local", "share", "omarchy", "agent-local", "models", rid)
   others = {(load_model(other) or {}).get("pair", {}).get("image_id") for other in known_models() if other != rid}
-  command = f"podman rm -f {q(worker_name(rid))} >/dev/null 2>&1; rm -rf -- {q(base)}"
-  if setup["image_id"] not in others:
-    command += f"; podman rmi {q(setup['image_id'])} >/dev/null 2>&1"
   try:
+    base = os.path.join(peer_data_dir(setup), "models", rid)
+    command = f"podman rm -f {q(worker_name(rid))} >/dev/null 2>&1; rm -rf -- {q(base)}"
+    if setup["image_id"] not in others:
+      command += f"; podman rmi {q(setup['image_id'])} >/dev/null 2>&1"
     pair_ssh(setup["peer"], command + "; true", timeout=600)
   except LocalError as error:
     if not local_only:
